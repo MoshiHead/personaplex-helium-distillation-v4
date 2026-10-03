@@ -27,6 +27,11 @@ PATHS = [
     "distill/schedule.py",
     "distill/losses.py",
     "distill/eval.py",
+    "distill/init_from_teacher.py",
+    # The pod's distill/ otherwise comes from the GitHub clone, which has no student_ppx_m.yaml -- without
+    # these two lines `STUDENT_CONFIG = "student_ppx_m"` dies in load_student_config with FileNotFoundError.
+    "distill/configs/student_ppx_s.yaml",
+    "distill/configs/student_ppx_m.yaml",
 ]
 
 
@@ -34,8 +39,28 @@ def magic_for(path: str) -> str:
     return "%%writefile {REPO_DIR}/" + path
 
 
+def ensure_dirs_cell(nb) -> bool:
+    """The notebook's `os.makedirs(... "distill", "data")` cell must also create distill/configs, because
+    %%writefile does not create folders."""
+    for c in nb["cells"]:
+        if c["cell_type"] != "code":
+            continue
+        src = "".join(c["source"])
+        if 'os.makedirs(os.path.join(REPO_DIR, "distill", "data")' in src and '"configs"' not in src:
+            c["source"] = [
+                "import os\n",
+                'for _d in ("data", "configs"):      # %%writefile does not create folders\n',
+                '    os.makedirs(os.path.join(REPO_DIR, "distill", _d), exist_ok=True)\n',
+                'print("writing updated training code into", os.path.join(REPO_DIR, "distill"))\n',
+            ]
+            return True
+    return False
+
+
 def main() -> int:
     nb = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    if ensure_dirs_cell(nb):
+        print("  UPDATE mkdir cell (now creates distill/configs too)")
     by_path = {}
     for i, c in enumerate(nb["cells"]):
         if c["cell_type"] != "code":

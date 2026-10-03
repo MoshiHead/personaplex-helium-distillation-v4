@@ -103,7 +103,25 @@ def compute_layer_scores(teacher: LMModel, batches: tp.Sequence[Batch]) -> torch
     return (score_sum / score_count).float()
 
 
-def select_layers(scores: torch.Tensor, num_layers: int, keep_first: int, keep_last: int) -> list[int]:
+def select_layers(scores: torch.Tensor, num_layers: int, keep_first: int, keep_last: int,
+                  spread: bool = True) -> list[int]:
+    """Pick `num_layers` teacher layers to initialize the student's stack from.
+
+    `spread=True` (default) spaces the DROPPED layers evenly and picks the lowest-scoring layer inside each
+    spacing bucket. `spread=False` is the original behaviour: take the top `num_layers` by score outright.
+
+    Why the default changed. Pure score ranking on the real 32-layer teacher selected
+        [0..16, 29, 30, 31]
+    -- it dropped layers 17-28, a CONTIGUOUS BLOCK OF 12. `compute_layer_scores` ranks by
+    `1 - cos(h[l], h[l+1])`, and in a deep transformer the late-middle layers change their input least in
+    cosine terms, so they all rank last together. But small cosine change does not mean small function: a
+    layer can make a low-norm, highly targeted write to the residual stream, which is exactly how factual
+    recall behaves. Worse, a contiguous hole breaks composition the most: the student's layer initialized
+    from teacher layer 29 receives the output of teacher layer 16, a distribution it never saw.
+
+    Spacing the drops keeps the residual pipeline roughly proportional while still removing the
+    least-load-bearing layer in each neighbourhood, and it cannot produce a 12-layer hole.
+    """
     total = scores.shape[0]
     assert num_layers <= total
     forced = set(range(keep_first)) | set(range(total - keep_last, total))
@@ -112,8 +130,25 @@ def select_layers(scores: torch.Tensor, num_layers: int, keep_first: int, keep_l
     )
     remaining_slots = num_layers - len(forced)
     candidates = [l for l in range(total) if l not in forced]
-    candidates.sort(key=lambda l: scores[l].item(), reverse=True)
-    chosen = forced | set(candidates[:remaining_slots])
+    if not spread:
+        ranked = sorted(candidates, key=lambda l: scores[l].item(), reverse=True)
+        chosen = forced | set(ranked[:remaining_slots])
+        return sorted(chosen)
+
+    n_drop = len(candidates) - remaining_slots
+    if n_drop <= 0:
+        return sorted(forced | set(candidates))
+    drop: set[int] = set()
+    for b in range(n_drop):                       # one drop per evenly spaced bucket
+        lo = int(round(b * len(candidates) / n_drop))
+        hi = int(round((b + 1) * len(candidates) / n_drop))
+        bucket = [l for l in candidates[lo:hi] if l not in drop]
+        if bucket:
+            drop.add(min(bucket, key=lambda l: scores[l].item()))
+    leftover = sorted((l for l in candidates if l not in drop), key=lambda l: scores[l].item())
+    while len(drop) < n_drop and leftover:        # rounding can leave a bucket empty
+        drop.add(leftover.pop(0))
+    chosen = forced | (set(candidates) - drop)
     return sorted(chosen)
 
 
@@ -300,8 +335,15 @@ def _init_norm_alpha(teacher_norm: torch.nn.Module, student_norm: torch.nn.Modul
     arbitrary change of basis: if `down` genuinely rotates or truncates the residual
     space, `student_norm(x @ down)` computed with the teacher's `alpha` values (which
     were learned for teacher-basis channels) would apply the WRONG scale to WRONG
-    channels post-rotation, in general. Resetting to ones there is the safe, neutral
-    choice -- P1 "Align" training calibrates it quickly.
+    channels post-rotation, in general.
+
+    Ones is nevertheless the CORRECT value here, not merely a neutral one: both callers
+    fold `diag(alpha)` into the linear map that consumes the normalized activations
+    (q/k/v `in_proj` for `norm1`, `gating.linear_in` for `norm2`) BEFORE reducing its
+    width -- see the folding comments in `init_attention_layer` / `init_ffn_layer`.
+    An earlier version only reset alpha and folded nothing, which silently discarded the
+    teacher's trained pre-attention and pre-FFN scales (40 vectors of 4096 values on the
+    real model) and left P1 "Align" to relearn them from scratch.
 
     But when `down` is the identity (no rotation at all -- see `_is_identity_projection`),
     each student channel IS the corresponding teacher channel, so the teacher's `alpha`
@@ -332,7 +374,24 @@ def init_attention_layer(
     d_in = attn_t.in_proj_weight.shape[1]
     assert attn_t.in_proj_weight.shape[0] == 3 * num_teacher_heads * teacher_head_dim
 
-    w_qkv = attn_t.in_proj_weight.view(3, num_teacher_heads, teacher_head_dim, d_in)
+    # Fold the PRE-NORM scale into the projection that consumes it, instead of discarding it.
+    # `_sa_block` is pre-norm (moshi/modules/transformer.py): update = self_attn(norm1(x)), and
+    # `_rms_norm(x, alpha) = (x * rsqrt(mean(x^2) + eps)) * alpha`. Because the only consumer of
+    # norm1(x) is the LINEAR q/k/v projection,
+    #     W @ ((x / rms) * alpha)  ==  (W @ diag(alpha)) @ (x / rms)
+    # exactly. So scaling `in_proj_weight`'s INPUT columns by alpha before the width reduction lets the
+    # student's norm1.alpha be ones and still reproduce the teacher -- whereas `_init_norm_alpha` alone
+    # resets alpha to ones and throws the teacher's trained scale away (40 vectors of 4096 trained values
+    # on the real model). Measured on a tiny teacher with non-uniform alphas, folding recovers ~0.02-0.03
+    # top-1 text agreement and roughly halves the content KL at equal width.
+    # At an identity projection nothing is folded: `_init_norm_alpha` copies alpha across verbatim, which
+    # keeps tests/test_bit_exactness.py's identity-clone path exact.
+    in_proj = attn_t.in_proj_weight
+    if not _is_identity_projection(proj):
+        alpha1 = teacher_layer.norm1.alpha.detach().reshape(1, -1).to(in_proj.dtype)
+        in_proj = in_proj * alpha1                      # a copy; the teacher is never mutated
+
+    w_qkv = in_proj.view(3, num_teacher_heads, teacher_head_dim, d_in)
     w_q, w_k, w_v = w_qkv[0], w_qkv[1], w_qkv[2]  # each [num_teacher_heads, head_dim, d_in]
 
     down = proj.down.to(w_q.dtype)
@@ -421,11 +480,19 @@ def init_ffn_layer(
     down_r = proj.down.to(gate_t.linear_in.weight.dtype)
     up_r = proj.up.to(gate_t.linear_in.weight.dtype)
 
+    # Same pre-norm folding as in `init_attention_layer`: `_ff_block` computes gating(norm2(x)), and
+    # `linear_in` is linear, so diag(norm2.alpha) folds into its input columns exactly rather than being
+    # discarded by `_init_norm_alpha`.
+    lin_in = gate_t.linear_in.weight
+    if not _is_identity_projection(proj):
+        alpha2 = teacher_layer.norm2.alpha.detach().reshape(1, -1).to(lin_in.dtype)
+        lin_in = lin_in * alpha2                        # a copy; the teacher is never mutated
+
     # linear_in: [2*teacher_hidden, teacher_dim] -> [2*student_hidden, student_dim].
     # READS the residual (`up_r.T`, Case A); selects the same `student_hidden` output
     # channels in BOTH halves (gate / value, see moshi/modules/gating.py), since hidden
     # channel c = activation(gate[c]) * value[c] depends only on row c of each half.
-    w_in = gate_t.linear_in.weight.view(2, teacher_hidden, -1)[:, channel_idx, :]
+    w_in = lin_in.view(2, teacher_hidden, -1)[:, channel_idx, :]
     w_in_reduced = torch.stack([w_in[i] @ up_r.T for i in range(2)], dim=0)
     gate_s.linear_in.weight.copy_(w_in_reduced.reshape(2 * student_hidden, -1).to(gate_s.linear_in.weight.dtype))
 
@@ -648,6 +715,7 @@ def initialize_student(
     calibration_batches: tp.Sequence[Batch],
     keep_first: int = 3,
     keep_last: int = 3,
+    spread_layers: bool = True,
 ) -> dict:
     """Run the full initialization pipeline (steps 1-6 above) in place on `student`.
     Returns a dict of diagnostics (layer scores, chosen layers, bridge residual)
@@ -658,7 +726,7 @@ def initialize_student(
     num_student_layers = len(student.transformer.layers)
 
     scores = compute_layer_scores(teacher, calibration_batches)
-    selected = select_layers(scores, num_student_layers, keep_first, keep_last)
+    selected = select_layers(scores, num_student_layers, keep_first, keep_last, spread=spread_layers)
     logger.info("Selected teacher layers: %s (scores=%s)", selected, [round(scores[l].item(), 4) for l in selected])
 
     def run_teacher(batch: Batch):

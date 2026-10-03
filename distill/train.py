@@ -437,11 +437,24 @@ def init_fidelity_report(student, teacher, batches: list[torch.Tensor], max_batc
         return {"content_frames": 0, "note": "no content frames in the calibration batches"}
     rep = {"content_frames": n, "kl_text_content": round(sum(kls) / len(kls), 4),
            "top1_agree": round(sum(t1s) / len(t1s), 4), "top5_agree": round(sum(t5s) / len(t5s), 4)}
-    verdict = ("init preserved the text pathway -- the gap is budget/weighting" if rep["top1_agree"] > 0.5 else
-               "init DESTROYED the text pathway -- widen the student (see student_ppx_m.yaml); more steps "
-               "will not recover this" if rep["top1_agree"] < 0.2 else
-               "init partially preserved the text pathway -- trainable, but consider a wider student")
-    rep["verdict"] = verdict
+    # This number is a ZERO-SHOT reading of an init that was never meant to be zero-shot functional:
+    # P1_align exists precisely to repair the layer-boundary mismatch the reduction creates. An earlier
+    # version of this function declared "init DESTROYED the text pathway -- widen the student" below 0.2
+    # top-1, which on the real 7B teacher fired at 0.0092 while the run went on to halve kl_text and cut
+    # bridge_raw from 1.32 to 0.66 in 120 steps. Absolute top-1 thresholds do not transfer across scales,
+    # so the verdict no longer prescribes an architecture change. Decide from TRAINABILITY instead:
+    # `bridge_lstsq_residual` (logged next to this), and whether bridge_raw / kl_text_raw fall over P1.
+    rep["verdict"] = (
+        "informational only -- do NOT change architecture on this number alone. The init is expected to be "
+        "far from the teacher zero-shot; P1_align repairs it. Decide from the first validations instead: "
+        "val_kl_text_content and val_agree_text_content must improve, and train_log.csv's bridge_raw must "
+        "fall (bridge_raw < 1.0 implies cosine > 0, i.e. the pathway is intact and trainable). Only if "
+        "bridge_raw stays flat near its starting value AND val_kl_text_content stalls across several "
+        "evaluations should you widen the student (distill/configs/student_ppx_m.yaml)."
+    )
+    if rep["top1_agree"] > 0.5:
+        rep["verdict"] = ("init already reproduces the teacher's text argmax zero-shot -- unusually good; "
+                          "the remaining gap is budget/weighting, not architecture.")
     return rep
 
 
@@ -824,7 +837,8 @@ def train(args):
                          frames_per_batch=int(calib[0].shape[-1]) if calib else 0,
                          skip_frames=args.calib_skip_frames)
                 diag = initialize_student(student, teacher, calib, student_cfg.init.keep_first,
-                                          student_cfg.init.keep_last)
+                                          student_cfg.init.keep_last,
+                                          spread_layers=(args.layer_selection == "spread"))
                 selected_layers = [int(x) for x in diag["selected_layers"]]
                 torch.save({"student_state_dict": ckpt.trainable_state_dict(student),
                             "selected_teacher_layers": selected_layers, "diag": {k: v for k, v in diag.items()
@@ -1401,6 +1415,11 @@ def main():
                          "teacher is answering rather than while it loads the voice prompt and says hello. "
                          "~150 frames = 12 s at 12.5 Hz. 0 still starts at the end of the prefix (the prompt "
                          "is excluded either way) -- it just includes the greeting.")
+    ap.add_argument("--layer-selection", choices=["spread", "score"], default="spread",
+                    help="how init_from_teacher picks which teacher layers to keep. 'score' is pure "
+                         "1-cos(h[l],h[l+1]) ranking, which on the real teacher dropped layers 17-28 -- a "
+                         "contiguous block of 12 -- because late-middle layers all rank last together. "
+                         "'spread' spaces the drops and takes the lowest-scoring layer in each bucket.")
     ap.add_argument("--calib-prefer-scenario", default="multi_turn,single_followup,repeat_clarify",
                     help="comma-separated scenarios to prefer for calibration (knowledge-heavy Q&A rather than "
                          "backchannel/distractor/casual turn-taking). Empty = no preference.")
