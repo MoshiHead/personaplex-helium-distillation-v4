@@ -1,0 +1,106 @@
+{
+ "built": "2026-10-03T11:22:31",
+ "builder": "tools/build_text_corpus.py",
+ "format": "JSONL, one document per line, 'text' key -- read by distill/data/text_dataset.py",
+ "sources": {
+  "wikipedia": {
+   "files_or_articles": 91,
+   "license": "CC BY-SA 4.0"
+  },
+  "mastering_bitcoin": {
+   "files_or_articles": 15,
+   "license": "CC BY-SA 4.0"
+  },
+  "ethereum_org": {
+   "files_or_articles": 43,
+   "license": "CC BY 4.0"
+  }
+ },
+ "totals": {
+  "documents": 1522,
+  "characters": 2255239,
+  "words": 354893
+ },
+ "files": {
+  "01_wikipedia_crypto.jsonl": {
+   "documents": 894,
+   "characters": 1254512,
+   "bytes": 1385104,
+   "license": "CC BY-SA 4.0"
+  },
+  "02_mastering_bitcoin.jsonl": {
+   "documents": 290,
+   "characters": 606682,
+   "bytes": 668985,
+   "license": "CC BY-SA 4.0"
+  },
+  "03_ethereum_org_docs.jsonl": {
+   "documents": 338,
+   "characters": 394045,
+   "bytes": 454477,
+   "license": "CC BY 4.0"
+  }
+ },
+ "by_topic": {
+  "bitcoin": {
+   "documents": 89,
+   "characters": 144068
+  },
+  "bitcoin_history": {
+   "documents": 123,
+   "characters": 180914
+  },
+  "bitcoin_transactions": {
+   "documents": 94,
+   "characters": 159319
+  },
+  "blockchain": {
+   "documents": 104,
+   "characters": 158302
+  },
+  "crypto_fundamentals": {
+   "documents": 243,
+   "characters": 354475
+  },
+  "crypto_security": {
+   "documents": 195,
+   "characters": 255758
+  },
+  "ethereum": {
+   "documents": 265,
+   "characters": 332820
+  },
+  "mining_and_pow": {
+   "documents": 159,
+   "characters": 258439
+  },
+  "stablecoins": {
+   "documents": 57,
+   "characters": 73157
+  },
+  "wallets_and_keys": {
+   "documents": 193,
+   "characters": 337987
+  }
+ },
+ "rejected": {
+  "too_short": 565,
+  "exact_duplicate": 61,
+  "too_few_sentences": 46,
+  "too_few_words": 24,
+  "line_fragments": 17,
+  "digit_heavy": 5,
+  "low_letter_ratio": 2
+ },
+ "missing_sources": [],
+ "filters": {
+  "min_chars": 400,
+  "max_chars": 6000,
+  "min_words": 60,
+  "max_digit_ratio": 0.12,
+  "min_letter_ratio": 0.6,
+  "min_avg_line_chars": 40,
+  "near_dup_shingle": 8,
+  "near_dup_threshold": 0.5
+ }
+}
